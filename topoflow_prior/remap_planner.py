@@ -32,34 +32,62 @@ def naive_head_first(
     return pid_b * num_h * num_m + pid_m * num_h + pid_h
 
 
-def swizzled_block_first(
-    pid_m: int, pid_h: int, pid_b: int, num_m: int, num_h: int, num_b: int, num_xcds: int = 8
-) -> int:
-    # Group by m-block first so blocks with the same query tile land on the
-    # same XCD.  Linearise as m-outer, b-middle, h-inner so that the MI300X
-    # round-robin scheduler places consecutive m-block IDs on consecutive XCDs,
-    # keeping each XCD's L2 warm for the corresponding Q tile.
-    return pid_m * num_b * num_h + pid_b * num_h + pid_h
-
-
 def swizzled_head_first(
     pid_m: int, pid_h: int, pid_b: int, num_m: int, num_h: int, num_b: int, num_xcds: int = 8
 ) -> int:
-    # Group by head first so all m-blocks of a head receive consecutive program
-    # IDs (arXiv 2511.02132).  With num_xcds XCDs and B*M blocks per head the
-    # scheduler places a head's blocks on at most min(B*M, num_xcds) XCDs,
-    # maximising K/V reuse in each XCD's 4 MB L2.
-    # Linearise as h-outer, b-middle, m-inner.
-    return pid_h * num_b * num_m + pid_b * num_m + pid_m
+    """Pack all blocks of a head onto the same XCD.
+
+    Models the MI300X round-robin XCD scheduler (program i runs on XCD
+    i % num_xcds). Head h is assigned to XCD (h % num_xcds); heads h and
+    h+num_xcds share an XCD so K/V for those heads can hit one L2.
+    Requires num_h % num_xcds == 0.
+    See arXiv 2511.02132 (NUMA attention).
+    """
+    if num_h % num_xcds != 0:
+        raise ValueError(
+            f"swizzled_head_first requires num_h ({num_h}) divisible by "
+            f"num_xcds ({num_xcds})"
+        )
+    xcd = pid_h % num_xcds
+    head_in_xcd = pid_h // num_xcds
+    program_in_batch = (head_in_xcd * num_m + pid_m) * num_xcds + xcd
+    return pid_b * num_h * num_m + program_in_batch
+
+
+def swizzled_block_first(
+    pid_m: int, pid_h: int, pid_b: int, num_m: int, num_h: int, num_b: int, num_xcds: int = 8
+) -> int:
+    """Pack all m-blocks at the same m-index across heads onto the same XCD.
+
+    Models the MI300X round-robin XCD scheduler. m-block m is assigned to
+    XCD (m % num_xcds). m-blocks m and m+num_xcds share an XCD.
+    Within each XCD group, heads vary fastest so that consecutive program ids
+    step through heads before advancing to the next m-index group; this is
+    distinct from naive_block_first (where m varies fastest).
+    Requires num_m % num_xcds == 0.
+    """
+    if num_m % num_xcds != 0:
+        raise ValueError(
+            f"swizzled_block_first requires num_m ({num_m}) divisible by "
+            f"num_xcds ({num_xcds})"
+        )
+    xcd = pid_m % num_xcds
+    block_in_xcd = pid_m // num_xcds
+    program_in_batch = (block_in_xcd * num_h + pid_h) * num_xcds + xcd
+    return pid_b * num_h * num_m + program_in_batch
 
 
 _REMAP_NOTES = {
     "naive_block_first": "Baseline: m-blocks contiguous; XCD reuse only across batches.",
     "naive_head_first": "Heads swept within m-block; little K/V locality on XCDs.",
-    "swizzled_block_first": "M-blocks grouped per XCD; helpful when Q tile is reused.",
+    "swizzled_block_first": (
+        "M-blocks at the same m-index share an XCD via round-robin scheduling "
+        "(requires num_m % num_xcds == 0)."
+    ),
     "swizzled_head_first": (
-        "Heads grouped per XCD; all blocks of a head land on same XCD so K/V "
-        "fits in 4MB L2 (paper: arXiv 2511.02132)."
+        "All blocks of one head land on the same XCD via round-robin scheduling "
+        "(requires num_h % num_xcds == 0). K/V for that head fits in 4MB L2 "
+        "(arXiv 2511.02132)."
     ),
 }
 

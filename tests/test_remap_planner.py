@@ -14,7 +14,7 @@ from topoflow_prior.remap_planner import (
 
 @pytest.fixture
 def grid():
-    return dict(num_m=4, num_h=8, num_b=2, num_xcds=8)
+    return dict(num_m=16, num_h=16, num_b=2, num_xcds=8)
 
 
 def _all_outputs(fn, grid):
@@ -56,18 +56,42 @@ def test_naive_block_first_layout(grid):
     assert naive_block_first(0, 1, 0, grid["num_m"], grid["num_h"], grid["num_b"], grid["num_xcds"]) == grid["num_m"]
 
 
-def test_swizzled_head_first_groups_heads_to_xcds(grid):
-    """Heads in the same xcd_group should have consecutive program ids in a stride."""
+def test_swizzled_head_first_groups_heads_to_xcds_property(grid):
+    """All blocks of head h must hit XCD (h % num_xcds) under round-robin scheduling."""
     g = grid
-    heads_per_group = (g["num_h"] + g["num_xcds"] - 1) // g["num_xcds"]
-    # Test consistency with the spec's formula
-    expected = (
-        0 * g["num_h"] * g["num_m"]
-        + 0 * heads_per_group * g["num_m"]
-        + 0 * g["num_m"]
-        + 0
-    )
-    assert swizzled_head_first(0, 0, 0, g["num_m"], g["num_h"], g["num_b"], g["num_xcds"]) == expected
+    for pid_h in range(g["num_h"]):
+        expected_xcd = pid_h % g["num_xcds"]
+        for pid_m in range(g["num_m"]):
+            for pid_b in range(g["num_b"]):
+                pid = swizzled_head_first(
+                    pid_m, pid_h, pid_b,
+                    g["num_m"], g["num_h"], g["num_b"], g["num_xcds"],
+                )
+                assert pid % g["num_xcds"] == expected_xcd, (
+                    f"head {pid_h} block (m={pid_m}, b={pid_b}) landed on "
+                    f"XCD {pid % g['num_xcds']}, expected {expected_xcd}"
+                )
+
+
+def test_swizzled_block_first_groups_blocks_to_xcds_property(grid):
+    """All blocks at m-index m must hit XCD (m % num_xcds)."""
+    g = grid
+    for pid_m in range(g["num_m"]):
+        expected_xcd = pid_m % g["num_xcds"]
+        for pid_h in range(g["num_h"]):
+            for pid_b in range(g["num_b"]):
+                pid = swizzled_block_first(
+                    pid_m, pid_h, pid_b,
+                    g["num_m"], g["num_h"], g["num_b"], g["num_xcds"],
+                )
+                assert pid % g["num_xcds"] == expected_xcd
+
+
+def test_swizzle_raises_when_not_divisible():
+    with pytest.raises(ValueError, match="divisible"):
+        swizzled_head_first(0, 0, 0, num_m=4, num_h=7, num_b=1, num_xcds=8)
+    with pytest.raises(ValueError, match="divisible"):
+        swizzled_block_first(0, 0, 0, num_m=7, num_h=8, num_b=1, num_xcds=8)
 
 
 def test_remap_kinds_constant():
