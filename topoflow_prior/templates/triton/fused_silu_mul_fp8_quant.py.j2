@@ -1,0 +1,189 @@
+# TOPOFLOW_INTENT: Fused SiLU + Mul + per-group FP8 quantization.
+# TOPOFLOW_INTENT: Avoid writing the bf16 silu(gate)*up intermediate to HBM.
+# TOPOFLOW_INTENT: Each program owns one group of size GROUP_SIZE in the H dim
+#                  so per-group amax/scale stay local to the tile.
+# TOPOFLOW_INTENT: Tile = BLOCK_M={{ BLOCK_M }} x BLOCK_H={{ BLOCK_H }},
+#                  GROUP_SIZE={{ GROUP_SIZE }}, num_warps={{ num_warps }}.
+# TOPOFLOW_INTENT: Mutate BLOCK_M in [8,16,32], BLOCK_H in [64,128,256],
+#                  num_warps in [4,8]; keep BLOCK_H related to GROUP_SIZE by
+#                  bh % gs == 0 or gs % bh == 0.
+
+import torch
+import triton
+import triton.language as tl
+
+BLOCK_M: tl.constexpr = {{ BLOCK_M }}
+BLOCK_H: tl.constexpr = {{ BLOCK_H }}
+GROUP_SIZE: tl.constexpr = {{ GROUP_SIZE }}
+FP8_E4M3_MAX: tl.constexpr = 448.0
+
+
+@triton.jit
+def fused_silu_mul_fp8_quant_kernel(
+    x_ptr, y_ptr, scale_ptr,
+    E, T, H,
+    stride_xe, stride_xt, stride_xh,
+    stride_ye, stride_yt, stride_yh,
+    stride_se, stride_st, stride_sg,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    FP8_E4M3_MAX: tl.constexpr,
+):
+    pid_e = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_g = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < T
+
+{% if BLOCK_H == GROUP_SIZE %}
+    # TOPOFLOW_INTENT branch: BLOCK_H == GROUP_SIZE -> one group per tile, single pass.
+    offs_h = pid_g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    mask = mask_m[:, None] & (offs_h[None, :] < H)
+    gate_ptrs = (
+        x_ptr
+        + pid_e * stride_xe
+        + offs_m[:, None] * stride_xt
+        + offs_h[None, :] * stride_xh
+    )
+    up_ptrs = gate_ptrs + H * stride_xh
+    gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
+    activated = (gate * tl.sigmoid(gate)) * up
+    amax = tl.max(tl.abs(activated), axis=1)
+    scale = amax / FP8_E4M3_MAX
+    scale_safe = tl.where(scale > 0, scale, 1.0)
+    y_fp32 = activated / scale_safe[:, None]
+    y_fp8 = y_fp32.to(tl.float8e4nv)
+    y_ptrs = (
+        y_ptr
+        + pid_e * stride_ye
+        + offs_m[:, None] * stride_yt
+        + offs_h[None, :] * stride_yh
+    )
+    tl.store(y_ptrs, y_fp8, mask=mask)
+    scale_ptrs = (
+        scale_ptr
+        + pid_e * stride_se
+        + offs_m * stride_st
+        + pid_g * stride_sg
+    )
+    tl.store(scale_ptrs, scale, mask=mask_m)
+{% elif BLOCK_H > GROUP_SIZE %}
+    # TOPOFLOW_INTENT branch: BLOCK_H > GROUP_SIZE -> N groups per tile (N = BLOCK_H/GROUP_SIZE).
+    N_GROUPS_PER_TILE: tl.constexpr = BLOCK_H // GROUP_SIZE
+    offs_h = pid_g * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = mask_m[:, None] & (offs_h[None, :] < H)
+    gate_ptrs = (
+        x_ptr
+        + pid_e * stride_xe
+        + offs_m[:, None] * stride_xt
+        + offs_h[None, :] * stride_xh
+    )
+    up_ptrs = gate_ptrs + H * stride_xh
+    gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
+    activated = (gate * tl.sigmoid(gate)) * up
+    activated_g = tl.reshape(activated, (BLOCK_M, N_GROUPS_PER_TILE, GROUP_SIZE))
+    amax_g = tl.max(tl.abs(activated_g), axis=2)
+    scale_g = amax_g / FP8_E4M3_MAX
+    scale_safe_g = tl.where(scale_g > 0, scale_g, 1.0)
+    y_fp32 = activated_g / scale_safe_g[:, :, None]
+    y_fp32 = tl.reshape(y_fp32, (BLOCK_M, BLOCK_H))
+    y_fp8 = y_fp32.to(tl.float8e4nv)
+    y_ptrs = (
+        y_ptr
+        + pid_e * stride_ye
+        + offs_m[:, None] * stride_yt
+        + offs_h[None, :] * stride_yh
+    )
+    tl.store(y_ptrs, y_fp8, mask=mask)
+    offs_g = pid_g * N_GROUPS_PER_TILE + tl.arange(0, N_GROUPS_PER_TILE)
+    scale_ptrs = (
+        scale_ptr
+        + pid_e * stride_se
+        + offs_m[:, None] * stride_st
+        + offs_g[None, :] * stride_sg
+    )
+    tl.store(scale_ptrs, scale_g, mask=mask_m[:, None])
+{% else %}
+    # TOPOFLOW_INTENT branch: BLOCK_H < GROUP_SIZE -> iterate BLOCK_H chunks within one group.
+    ITERS: tl.constexpr = GROUP_SIZE // BLOCK_H
+    offs_h_base = pid_g * GROUP_SIZE
+    # Pass 1: compute amax across the group.
+    amax = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for i in tl.static_range(ITERS):
+        offs_h = offs_h_base + i * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask = mask_m[:, None] & (offs_h[None, :] < H)
+        gate_ptrs = (
+            x_ptr
+            + pid_e * stride_xe
+            + offs_m[:, None] * stride_xt
+            + offs_h[None, :] * stride_xh
+        )
+        up_ptrs = gate_ptrs + H * stride_xh
+        gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
+        activated = (gate * tl.sigmoid(gate)) * up
+        chunk_max = tl.max(tl.abs(activated), axis=1)
+        amax = tl.maximum(amax, chunk_max)
+    scale = amax / FP8_E4M3_MAX
+    scale_safe = tl.where(scale > 0, scale, 1.0)
+    # Pass 2: recompute activated and store quantized output.
+    for i in tl.static_range(ITERS):
+        offs_h = offs_h_base + i * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask = mask_m[:, None] & (offs_h[None, :] < H)
+        gate_ptrs = (
+            x_ptr
+            + pid_e * stride_xe
+            + offs_m[:, None] * stride_xt
+            + offs_h[None, :] * stride_xh
+        )
+        up_ptrs = gate_ptrs + H * stride_xh
+        gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
+        activated = (gate * tl.sigmoid(gate)) * up
+        y_fp32 = activated / scale_safe[:, None]
+        y_fp8 = y_fp32.to(tl.float8e4nv)
+        y_ptrs = (
+            y_ptr
+            + pid_e * stride_ye
+            + offs_m[:, None] * stride_yt
+            + offs_h[None, :] * stride_yh
+        )
+        tl.store(y_ptrs, y_fp8, mask=mask)
+    scale_ptrs = (
+        scale_ptr
+        + pid_e * stride_se
+        + offs_m * stride_st
+        + pid_g * stride_sg
+    )
+    tl.store(scale_ptrs, scale, mask=mask_m)
+{% endif %}
+
+
+def fused_silu_mul_fp8_quant(x, group_size: int = {{ GROUP_SIZE }}):
+    """Host wrapper. x: [E, T, 2H] bf16. Returns (y_fp8 [E,T,H], scale [E,T,H/group_size])."""
+    assert x.ndim == 3, "expected x of shape [E, T, 2H]"
+    E, T, two_H = x.shape
+    assert two_H % 2 == 0
+    H = two_H // 2
+    assert H % group_size == 0, "group_size must divide H"
+    y = torch.empty((E, T, H), dtype=torch.float8_e4m3fn, device=x.device)
+    G = H // group_size
+    scale = torch.empty((E, T, G), dtype=torch.float32, device=x.device)
+    grid = (E, triton.cdiv(T, BLOCK_M), G if BLOCK_H <= group_size else G // (BLOCK_H // group_size))
+    fused_silu_mul_fp8_quant_kernel[grid](
+        x, y, scale,
+        E, T, H,
+        x.stride(0), x.stride(1), x.stride(2),
+        y.stride(0), y.stride(1), y.stride(2),
+        scale.stride(0), scale.stride(1), scale.stride(2),
+        BLOCK_M=BLOCK_M,
+        BLOCK_H=BLOCK_H,
+        GROUP_SIZE=GROUP_SIZE,
+        FP8_E4M3_MAX=FP8_E4M3_MAX,
+        num_warps={{ num_warps }},
+    )
+    return y, scale
