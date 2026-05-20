@@ -1,0 +1,101 @@
+# TOPOFLOW_INTENT: Fused RMSNorm + Residual Add for Llama/DeepSeek-style transformer
+#                  layers. The residual stream (x + residual) is written back as a
+#                  second output so the next layer can read it directly.
+# TOPOFLOW_INTENT: Avoid one HBM round trip of the activation tensor compared to the
+#                  unfused (add + rmsnorm) pipeline.
+# TOPOFLOW_INTENT: BLOCK_N = next_power_of_2(N) so each program owns a full row;
+#                  the mean-of-squares is a single tl.sum with no cross-tile fixup.
+# TOPOFLOW_INTENT: Tile = BLOCK_M={{ BLOCK_M }} rows x BLOCK_N={{ BLOCK_N }},
+#                  num_warps={{ num_warps }}.
+# TOPOFLOW_INTENT: Mutate BLOCK_M in [1, 2, 4, 8], num_warps in [4, 8]. Keep
+#                  BLOCK_N = next_power_of_2(N); shrinking it forces a two-pass
+#                  reduction that this kernel does not implement.
+
+import torch
+import triton
+import triton.language as tl
+
+BLOCK_M = {{ BLOCK_M }}
+BLOCK_N = {{ BLOCK_N }}
+EPS_DEFAULT = 1e-6
+
+
+@triton.jit
+def rmsnorm_residual_kernel(
+    x_ptr, residual_ptr, weight_ptr, out_ptr, x_residual_ptr,
+    M, N, eps,
+    stride_xm, stride_xn,
+    stride_rm, stride_rn,
+    stride_om, stride_on,
+    stride_xrm, stride_xrn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask = mask_m[:, None] & mask_n[None, :]
+
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+    r_ptrs = residual_ptr + offs_m[:, None] * stride_rm + offs_n[None, :] * stride_rn
+
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    r = tl.load(r_ptrs, mask=mask, other=0.0).to(tl.float32)
+    x_residual = x + r
+
+    # Per-row mean of squares -> reciprocal RMS.
+    sq = x_residual * x_residual
+    mean_sq = tl.sum(sq, axis=1) / N
+    rrms = 1.0 / tl.sqrt(mean_sq + eps)
+
+    # Broadcast weight along the row axis.
+    w = tl.load(weight_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+
+    output = x_residual * rrms[:, None] * w[None, :]
+
+    # Store x_residual first (the residual stream feeding the next layer).
+    xr_ptrs = (
+        x_residual_ptr
+        + offs_m[:, None] * stride_xrm
+        + offs_n[None, :] * stride_xrn
+    )
+    tl.store(xr_ptrs, x_residual.to(x_residual_ptr.dtype.element_ty), mask=mask)
+
+    # Store the normalized + scaled output.
+    o_ptrs = (
+        out_ptr
+        + offs_m[:, None] * stride_om
+        + offs_n[None, :] * stride_on
+    )
+    tl.store(o_ptrs, output.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def fused_rmsnorm_residual(x, residual, weight, eps: float = EPS_DEFAULT):
+    """Host wrapper. x, residual: [M, N] bf16; weight: [N] bf16.
+
+    Returns (output [M, N] bf16, x_residual [M, N] bf16).
+    """
+    assert x.shape == residual.shape, "x and residual must have the same shape"
+    M, N = x.shape
+    assert weight.shape == (N,), f"weight must be 1D of length N={N}"
+    assert N <= BLOCK_N, (
+        f"this kernel expects N ({N}) <= BLOCK_N ({BLOCK_N}); regenerate with "
+        f"BLOCK_N = next_power_of_2(N)"
+    )
+    out = torch.empty_like(x)
+    x_residual = torch.empty_like(x)
+    grid = (triton.cdiv(M, BLOCK_M),)
+    rmsnorm_residual_kernel[grid](
+        x, residual, weight, out, x_residual,
+        M, N, eps,
+        x.stride(0), x.stride(1),
+        residual.stride(0), residual.stride(1),
+        out.stride(0), out.stride(1),
+        x_residual.stride(0), x_residual.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps={{ num_warps }},
+    )
+    return out, x_residual

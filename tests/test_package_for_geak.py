@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from topoflow_prior.seed_generator import generate_seeds_for_fused_silu_mul_fp8_quant
+from topoflow_prior.seed_generator import (
+    generate_seeds_for_bias_gelu_dropout,
+    generate_seeds_for_fused_silu_mul_fp8_quant,
+    generate_seeds_for_rmsnorm_residual,
+)
 from topoflow_prior.topology import MI300X
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,3 +68,49 @@ def test_task_md_references_topoflow_notes(seed_bundle, tmp_path):
     for d in tasks_dir.iterdir():
         task_md = (d / "task.md").read_text()
         assert "topoflow_notes.md" in task_md or "topoflow_metadata.json" in task_md
+
+
+@pytest.fixture
+def rmsnorm_bundle(tmp_path):
+    bundle = tmp_path / "rms_seeds"
+    generate_seeds_for_rmsnorm_residual({"M": 2048, "N": 4096}, MI300X, bundle)
+    return bundle
+
+
+@pytest.fixture
+def bias_gelu_bundle(tmp_path):
+    bundle = tmp_path / "bgd_seeds"
+    generate_seeds_for_bias_gelu_dropout(
+        {"M": 2048, "N": 16384, "dropout_p": 0.1, "seed": 0}, MI300X, bundle
+    )
+    return bundle
+
+
+def test_packages_rmsnorm_residual_bundle(rmsnorm_bundle, tmp_path):
+    tasks_dir = tmp_path / "rms_tasks"
+    r = _run_cli(["--seed-bundle", str(rmsnorm_bundle), "--out", str(tasks_dir)])
+    assert r.returncode == 0, r.stderr
+    for d in sorted(tasks_dir.iterdir()):
+        if not d.is_dir():
+            continue
+        task_md = (d / "task.md").read_text()
+        assert "fused_rmsnorm_residual" in task_md
+        assert "MI300X" in task_md or "gfx942" in task_md
+        # tile_plan section uses BLOCK_N (not BLOCK_H) for this target
+        assert "BLOCK_N" in task_md
+        # generic shape rendering
+        assert "M=2048" in task_md and "N=4096" in task_md
+
+
+def test_packages_bias_gelu_dropout_bundle(bias_gelu_bundle, tmp_path):
+    tasks_dir = tmp_path / "bgd_tasks"
+    r = _run_cli(["--seed-bundle", str(bias_gelu_bundle), "--out", str(tasks_dir)])
+    assert r.returncode == 0, r.stderr
+    for d in sorted(tasks_dir.iterdir()):
+        if not d.is_dir():
+            continue
+        task_md = (d / "task.md").read_text()
+        assert "fused_bias_gelu_dropout" in task_md
+        assert "BLOCK_N" in task_md
+        # Generic shape rendering includes the extra kernel knobs.
+        assert "dropout_p=0.1" in task_md

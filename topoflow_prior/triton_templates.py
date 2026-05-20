@@ -39,6 +39,45 @@ def render_fused_silu_mul_fp8_quant(
     )
 
 
+def render_rmsnorm_residual(
+    tile_plan: TilePlan, shape: dict[str, Any]
+) -> str:
+    """Render the fused RMSNorm + residual add kernel for one tile plan.
+
+    Args:
+        tile_plan: BLOCK_M (rows per program), BLOCK_H (= BLOCK_N, full-row tile),
+            and num_warps.
+        shape: dict with at least keys ``M`` and ``N`` (used for sanity logging).
+    Returns:
+        Python source code (str) -- guaranteed to be syntactically valid Python.
+    """
+    template = _ENV.get_template("rmsnorm_residual.py.j2")
+    return template.render(
+        BLOCK_M=tile_plan.block_m,
+        BLOCK_N=tile_plan.block_h,
+        num_warps=tile_plan.num_warps,
+    )
+
+
+def render_bias_gelu_dropout(
+    tile_plan: TilePlan, shape: dict[str, Any]
+) -> str:
+    """Render the fused bias + GELU + dropout kernel for one tile plan.
+
+    Args:
+        tile_plan: BLOCK_M and BLOCK_H (= BLOCK_N here), plus num_warps.
+        shape: dict (unused by the template but accepted for interface parity).
+    Returns:
+        Python source code (str) -- guaranteed to be syntactically valid Python.
+    """
+    template = _ENV.get_template("bias_gelu_dropout.py.j2")
+    return template.render(
+        BLOCK_M=tile_plan.block_m,
+        BLOCK_N=tile_plan.block_h,
+        num_warps=tile_plan.num_warps,
+    )
+
+
 def render_attention_remap(
     tile_plan: TilePlan, remap_kind: str, shape: dict[str, Any]
 ) -> str:

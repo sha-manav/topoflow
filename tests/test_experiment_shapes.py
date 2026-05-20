@@ -72,3 +72,27 @@ def test_fused_h_divisible_by_group_size():
         H = int(h_match.group(1))
         gs = int(gs_match.group(1))
         assert H % gs == 0, f"H={H} not divisible by group_size={gs}"
+
+
+def test_rmsnorm_residual_shapes_file_exists_and_well_formed():
+    path = EXP_ROOT / "rmsnorm_residual" / "shapes.yaml"
+    assert path.exists(), f"missing config: {path}"
+    text = path.read_text()
+    assert "shapes:" in text
+    entries = [l for l in text.splitlines() if l.strip().startswith("- {")]
+    assert len(entries) >= 4, f"expected >=4 rmsnorm shapes, got {len(entries)}"
+    for line in entries:
+        for k in ("M:", "N:"):
+            assert k in line, f"missing {k} in entry: {line}"
+
+
+def test_bias_gelu_dropout_shapes_file_exists_and_well_formed():
+    path = EXP_ROOT / "bias_gelu_dropout" / "shapes.yaml"
+    assert path.exists(), f"missing config: {path}"
+    text = path.read_text()
+    assert "shapes:" in text
+    entries = [l for l in text.splitlines() if l.strip().startswith("- {")]
+    assert len(entries) >= 3, f"expected >=3 bias_gelu shapes, got {len(entries)}"
+    for line in entries:
+        for k in ("M:", "N:", "dropout_p:"):
+            assert k in line, f"missing {k} in entry: {line}"

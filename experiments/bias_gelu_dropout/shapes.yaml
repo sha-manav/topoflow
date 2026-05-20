@@ -1,0 +1,10 @@
+# Shape configurations for the fused Bias + GELU + Dropout target.
+# Used by generate_seeds.py / future sweep scripts.
+#
+# Each entry maps to: x [M, N] bf16 + bias [N] bf16 -> y [M, N] bf16,
+# dropout_mask [M, N] bool. dropout_p is the dropout probability used by tl.rand.
+
+shapes:
+  - {M: 2048,  N: 16384, dropout_p: 0.1}   # Llama-8B FFN
+  - {M: 32768, N: 16384, dropout_p: 0.1}   # large batch
+  - {M: 2048,  N: 32768, dropout_p: 0.1}   # Llama-70B FFN

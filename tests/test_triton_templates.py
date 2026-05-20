@@ -6,7 +6,9 @@ from topoflow_prior.remap_planner import REMAP_KINDS
 from topoflow_prior.schemas import TilePlan
 from topoflow_prior.triton_templates import (
     render_attention_remap,
+    render_bias_gelu_dropout,
     render_fused_silu_mul_fp8_quant,
+    render_rmsnorm_residual,
 )
 
 
@@ -124,6 +126,80 @@ def test_render_attention_remap_embeds_tile_and_shape_constants():
     assert "HEAD_DIM = 64" in code
     assert "NUM_XCDS = 8" in code
     assert "num_warps=8" in code
+
+
+# ---------------------------------------------------------------------------
+# render_rmsnorm_residual
+# ---------------------------------------------------------------------------
+
+
+def test_render_rmsnorm_residual_is_valid_python():
+    plan = TilePlan(block_m=4, block_h=4096, num_warps=4)
+    code = render_rmsnorm_residual(plan, {"M": 2048, "N": 4096})
+    ast.parse(code)
+    assert "# TOPOFLOW_INTENT" in code
+    assert code.count("# TOPOFLOW_INTENT") >= 3
+    assert "@triton.jit" in code
+    assert "BLOCK_M = 4" in code
+    assert "BLOCK_N = 4096" in code
+    assert "num_warps=4" in code
+    # Module-level constants are plain ints, NOT tl.constexpr.
+    assert "BLOCK_M: tl.constexpr = " not in code
+    assert "BLOCK_N: tl.constexpr = " not in code
+
+
+def test_render_rmsnorm_residual_different_plans_differ():
+    shape = {"M": 2048, "N": 4096}
+    a = render_rmsnorm_residual(TilePlan(1, 4096, 4), shape)
+    b = render_rmsnorm_residual(TilePlan(8, 4096, 8), shape)
+    assert a != b
+
+
+def test_render_rmsnorm_residual_handles_n_up_to_8192():
+    """Spec: kernel handles N up to 8192 in a single row per program."""
+    plan = TilePlan(block_m=2, block_h=8192, num_warps=8)
+    code = render_rmsnorm_residual(plan, {"M": 2048, "N": 8192})
+    ast.parse(code)
+    assert "BLOCK_N = 8192" in code
+
+
+# ---------------------------------------------------------------------------
+# render_bias_gelu_dropout
+# ---------------------------------------------------------------------------
+
+
+def test_render_bias_gelu_dropout_is_valid_python():
+    plan = TilePlan(block_m=4, block_h=2048, num_warps=4)
+    code = render_bias_gelu_dropout(plan, {"M": 2048, "N": 16384})
+    ast.parse(code)
+    assert "# TOPOFLOW_INTENT" in code
+    assert code.count("# TOPOFLOW_INTENT") >= 3
+    assert "@triton.jit" in code
+    assert "BLOCK_M = 4" in code
+    assert "BLOCK_N = 2048" in code
+    assert "num_warps=4" in code
+    # Dropout via tl.rand with deterministic seed.
+    assert "tl.rand(" in code
+    # Module-level constants are plain ints, not tl.constexpr.
+    assert "BLOCK_M: tl.constexpr = " not in code
+    assert "BLOCK_N: tl.constexpr = " not in code
+
+
+def test_render_bias_gelu_dropout_different_plans_differ():
+    shape = {"M": 2048, "N": 16384}
+    a = render_bias_gelu_dropout(TilePlan(1, 512, 4), shape)
+    b = render_bias_gelu_dropout(TilePlan(8, 4096, 8), shape)
+    assert a != b
+
+
+def test_render_bias_gelu_dropout_uses_tanh_approximation():
+    code = render_bias_gelu_dropout(
+        TilePlan(4, 2048, 4), {"M": 2048, "N": 16384}
+    )
+    # tanh approximation constants must be present.
+    assert "SQRT_2_OVER_PI" in code
+    assert "0.044715" in code
+    assert "tl.math.tanh" in code
 
 
 def test_render_attention_remap_decompositions_use_different_arithmetic(attn_plan, attn_shape):

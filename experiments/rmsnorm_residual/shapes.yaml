@@ -1,0 +1,11 @@
+# Shape configurations for the fused RMSNorm + Residual Add target.
+# Used by generate_seeds.py / future sweep scripts.
+#
+# Each entry maps to: x [M, N] bf16 + residual [M, N] bf16 + weight [N] bf16
+# -> output [M, N] bf16, x_residual [M, N] bf16.
+
+shapes:
+  - {M: 2048,  N: 4096}    # Llama-8B single batch
+  - {M: 32768, N: 4096}    # Llama-8B large batch
+  - {M: 2048,  N: 8192}    # Llama-70B hidden
+  - {M: 65536, N: 4096}    # very large batch

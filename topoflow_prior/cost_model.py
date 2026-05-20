@@ -10,6 +10,7 @@ from .schemas import CostEstimate, TilePlan
 _BYTES_BF16 = 2
 _BYTES_FP8 = 1
 _BYTES_FP32 = 4
+_BYTES_BOOL = 1
 
 # Rough VGPR budget per wavefront on MI300X, in bytes of fp32 register state
 # the kernel can hold without spilling to scratch (LDS / HBM). This is a
@@ -49,6 +50,23 @@ def estimate_fused_silu_mul_fp8_quant(
     )
 
 
+def _apply_register_and_vec_penalties(
+    fused_bytes: float, tile_plan: TilePlan
+) -> float:
+    """Shared helper: register-spill and vectorization signals for any tile.
+
+    register_bytes = BLOCK_M * BLOCK_H * 4 (fp32 intermediates per wavefront).
+    Above _REGISTER_BUDGET_BYTES, scale by the spill ratio. Below 16-byte vector
+    alignment for bf16 lanes (BLOCK_H % 8 == 0), apply a small discount.
+    """
+    register_bytes = tile_plan.block_m * tile_plan.block_h * _BYTES_FP32
+    if register_bytes > _REGISTER_BUDGET_BYTES:
+        fused_bytes *= register_bytes / _REGISTER_BUDGET_BYTES
+    if tile_plan.block_h % _VECTOR_LANES_BF16 == 0:
+        fused_bytes *= _VECTORIZATION_BONUS
+    return fused_bytes
+
+
 def estimate_tile_cost(
     E: int, T: int, H: int, group_size: int, tile_plan: TilePlan
 ) -> CostEstimate:
@@ -78,13 +96,7 @@ def estimate_tile_cost(
         input_read_extra = E * T * 2 * H * _BYTES_BF16
         fused += input_read_extra
 
-    register_bytes = tile_plan.block_m * tile_plan.block_h * _BYTES_FP32
-    if register_bytes > _REGISTER_BUDGET_BYTES:
-        spill_factor = register_bytes / _REGISTER_BUDGET_BYTES
-        fused *= spill_factor
-
-    if tile_plan.block_h % _VECTOR_LANES_BF16 == 0:
-        fused *= _VECTORIZATION_BONUS
+    fused = _apply_register_and_vec_penalties(fused, tile_plan)
 
     fused_bytes = int(fused)
     unfused_bytes = base.unfused_bytes
@@ -93,4 +105,103 @@ def estimate_tile_cost(
         unfused_bytes=unfused_bytes,
         bytes_saved=unfused_bytes - fused_bytes,
         score=fused_bytes / unfused_bytes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Target 2: Fused RMSNorm + Residual Add
+# ---------------------------------------------------------------------------
+
+
+def estimate_rmsnorm_residual(M: int, N: int) -> CostEstimate:
+    """Shape-level traffic for fused RMSNorm + residual add.
+
+    Fused path reads (x, residual, weight) and writes (output, x_residual).
+    Unfused path materializes x_residual to HBM between the add and the
+    rmsnorm-plus-scale kernels, adding one round trip of the activation
+    tensor (write + read = 2 * M * N * sizeof(bf16)).
+    """
+    fused = (
+        M * N * _BYTES_BF16  # x
+        + M * N * _BYTES_BF16  # residual
+        + N * _BYTES_BF16  # weight
+        + M * N * _BYTES_BF16  # output
+        + M * N * _BYTES_BF16  # x_residual
+    )
+    unfused_intermediate = 2 * M * N * _BYTES_BF16  # write + read of x_residual
+    unfused = fused + unfused_intermediate
+    return CostEstimate(
+        fused_bytes=fused,
+        unfused_bytes=unfused,
+        bytes_saved=unfused - fused,
+        score=fused / unfused,
+    )
+
+
+def estimate_tile_cost_rmsnorm_residual(
+    M: int, N: int, tile_plan: TilePlan
+) -> CostEstimate:
+    """Per-tile cost for RMSNorm+residual: shape traffic + register/vec penalties.
+
+    BLOCK_M * BLOCK_H * 4 fp32 bytes is the live activation tile (the kernel
+    holds the row in registers between the reduction pass and the normalize
+    pass). The planner uses BLOCK_H = next_pow2(N), so large N immediately
+    pressures registers; BLOCK_M > 1 makes that worse.
+    """
+    base = estimate_rmsnorm_residual(M, N)
+    fused = _apply_register_and_vec_penalties(float(base.fused_bytes), tile_plan)
+    fused_bytes = int(fused)
+    return CostEstimate(
+        fused_bytes=fused_bytes,
+        unfused_bytes=base.unfused_bytes,
+        bytes_saved=base.unfused_bytes - fused_bytes,
+        score=fused_bytes / base.unfused_bytes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Target 3: Fused Bias + GELU + Dropout
+# ---------------------------------------------------------------------------
+
+
+def estimate_bias_gelu_dropout(M: int, N: int) -> CostEstimate:
+    """Shape-level traffic for fused bias + GELU + dropout.
+
+    Fused reads (x, bias) and writes (y, dropout_mask). Unfused materializes
+    two intermediates to HBM (post-bias, post-GELU); each costs one round
+    trip = 2 * M * N * sizeof(bf16) = 4 * M * N bytes.
+    """
+    fused = (
+        M * N * _BYTES_BF16  # x
+        + N * _BYTES_BF16  # bias
+        + M * N * _BYTES_BF16  # y
+        + M * N * _BYTES_BOOL  # mask
+    )
+    unfused_intermediate = 2 * (2 * M * N * _BYTES_BF16)  # two round trips
+    unfused = fused + unfused_intermediate
+    return CostEstimate(
+        fused_bytes=fused,
+        unfused_bytes=unfused,
+        bytes_saved=unfused - fused,
+        score=fused / unfused,
+    )
+
+
+def estimate_tile_cost_bias_gelu_dropout(
+    M: int, N: int, tile_plan: TilePlan
+) -> CostEstimate:
+    """Per-tile cost for bias+GELU+dropout: shape traffic + register/vec penalties.
+
+    Pointwise op — no row constraint — so BLOCK_M and BLOCK_N can vary
+    independently. Large BLOCK_M * BLOCK_N stresses VGPRs (the cube of GELU's
+    tanh approximation is materialized in registers).
+    """
+    base = estimate_bias_gelu_dropout(M, N)
+    fused = _apply_register_and_vec_penalties(float(base.fused_bytes), tile_plan)
+    fused_bytes = int(fused)
+    return CostEstimate(
+        fused_bytes=fused_bytes,
+        unfused_bytes=base.unfused_bytes,
+        bytes_saved=base.unfused_bytes - fused_bytes,
+        score=fused_bytes / base.unfused_bytes,
     )

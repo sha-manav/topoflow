@@ -1,0 +1,89 @@
+# TOPOFLOW_INTENT: Fused Bias + GELU + Dropout for transformer FFN training.
+# TOPOFLOW_INTENT: Pointwise chain — collapses three launches into one and
+#                  eliminates two HBM round trips (post-bias and post-GELU).
+# TOPOFLOW_INTENT: Uses the tanh approximation of GELU
+#                  (0.5*x*(1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))).
+# TOPOFLOW_INTENT: Dropout uses tl.rand with a deterministic seed; the kept mask
+#                  is stored alongside the output so the backward pass can reuse it.
+# TOPOFLOW_INTENT: Tile = BLOCK_M={{ BLOCK_M }} rows x BLOCK_N={{ BLOCK_N }} cols,
+#                  num_warps={{ num_warps }}.
+# TOPOFLOW_INTENT: Mutate BLOCK_M in [1,2,4,8], BLOCK_N in [512,1024,2048,4096],
+#                  num_warps in [4,8]; filter BLOCK_N > N upstream.
+
+import torch
+import triton
+import triton.language as tl
+
+BLOCK_M = {{ BLOCK_M }}
+BLOCK_N = {{ BLOCK_N }}
+SQRT_2_OVER_PI = 0.7978845608028654
+GELU_C = 0.044715
+
+
+@triton.jit
+def bias_gelu_dropout_kernel(
+    x_ptr, bias_ptr, y_ptr, mask_ptr,
+    M, N, dropout_p, seed,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    stride_mm, stride_mn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask = mask_m[:, None] & mask_n[None, :]
+
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+    z = x + b[None, :]
+
+    # GELU tanh approximation: 0.5*z*(1 + tanh(sqrt(2/pi)*(z + 0.044715*z^3))).
+    z3 = z * z * z
+    inner = SQRT_2_OVER_PI * (z + GELU_C * z3)
+    gelu = 0.5 * z * (1.0 + tl.math.tanh(inner))
+
+    # Dropout: keep with probability (1 - dropout_p); scale kept values by 1/(1-p).
+    # Random uniforms come from tl.rand with a linearized offset so the same
+    # (seed, position) is reproducible.
+    offsets = offs_m[:, None] * N + offs_n[None, :]
+    rand = tl.rand(seed, offsets)
+    keep = rand > dropout_p
+    keep = keep & mask
+    inv_keep_p = 1.0 / (1.0 - dropout_p)
+    y = tl.where(keep, gelu * inv_keep_p, 0.0)
+
+    y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    tl.store(y_ptrs, y.to(y_ptr.dtype.element_ty), mask=mask)
+
+    m_ptrs = mask_ptr + offs_m[:, None] * stride_mm + offs_n[None, :] * stride_mn
+    tl.store(m_ptrs, keep, mask=mask)
+
+
+def fused_bias_gelu_dropout(x, bias, dropout_p: float = 0.1, seed: int = 0):
+    """Host wrapper. x: [M, N] bf16; bias: [N] bf16.
+
+    Returns (y [M, N] bf16, dropout_mask [M, N] bool).
+    """
+    M, N = x.shape
+    assert bias.shape == (N,), f"bias must be 1D of length N={N}"
+    y = torch.empty_like(x)
+    mask = torch.empty((M, N), dtype=torch.bool, device=x.device)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    bias_gelu_dropout_kernel[grid](
+        x, bias, y, mask,
+        M, N, dropout_p, seed,
+        x.stride(0), x.stride(1),
+        y.stride(0), y.stride(1),
+        mask.stride(0), mask.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps={{ num_warps }},
+    )
+    return y, mask

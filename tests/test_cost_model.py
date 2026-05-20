@@ -1,11 +1,19 @@
 import pytest
 
 from topoflow_prior.cost_model import (
+    estimate_bias_gelu_dropout,
     estimate_fused_silu_mul_fp8_quant,
+    estimate_rmsnorm_residual,
     estimate_tile_cost,
+    estimate_tile_cost_bias_gelu_dropout,
+    estimate_tile_cost_rmsnorm_residual,
 )
 from topoflow_prior.schemas import CostEstimate, TilePlan
-from topoflow_prior.tile_planner import tile_plans_fused_silu_mul_fp8
+from topoflow_prior.tile_planner import (
+    tile_plans_bias_gelu_dropout,
+    tile_plans_fused_silu_mul_fp8,
+    tile_plans_rmsnorm_residual,
+)
 
 
 def test_basic_shape_returns_cost_estimate():
@@ -108,3 +116,76 @@ def test_tile_cost_score_can_exceed_unity_for_bad_tiles():
     c = estimate_tile_cost(**_STD_SHAPE, tile_plan=TilePlan(32, 256, 4))
     assert c.score > 1.0
     assert c.bytes_saved < 0
+
+
+# ---------------------------------------------------------------------------
+# estimate_rmsnorm_residual + estimate_tile_cost_rmsnorm_residual
+# ---------------------------------------------------------------------------
+
+
+def test_rmsnorm_shape_cost_is_positive_for_realistic_shape():
+    c = estimate_rmsnorm_residual(M=2048, N=4096)
+    assert isinstance(c, CostEstimate)
+    assert c.fused_bytes > 0
+    assert c.unfused_bytes > c.fused_bytes
+    assert c.bytes_saved > 0
+    assert 0.0 < c.score < 1.0
+
+
+def test_rmsnorm_shape_cost_savings_equal_one_round_trip():
+    """Unfused intermediate = write+read of x_residual = 2 * M*N * sizeof(bf16) = 4*M*N."""
+    M, N = 2048, 4096
+    c = estimate_rmsnorm_residual(M=M, N=N)
+    assert c.bytes_saved == 2 * M * N * 2  # = 4 * M * N
+
+
+def test_rmsnorm_tile_cost_differs_across_plans():
+    """The 8-plan grid produces multiple distinct scores."""
+    M, N = 2048, 4096
+    plans = tile_plans_rmsnorm_residual(N=N)
+    scores = {estimate_tile_cost_rmsnorm_residual(M, N, p).score for p in plans}
+    assert len(scores) >= 2
+
+
+def test_rmsnorm_tile_cost_large_block_m_is_worse():
+    """BLOCK_M=8 with BLOCK_N=4096 (32KB register tile) is worse than BLOCK_M=1."""
+    M, N = 2048, 4096
+    big = estimate_tile_cost_rmsnorm_residual(M, N, TilePlan(8, 4096, 4))
+    small = estimate_tile_cost_rmsnorm_residual(M, N, TilePlan(1, 4096, 4))
+    assert big.score > small.score
+
+
+# ---------------------------------------------------------------------------
+# estimate_bias_gelu_dropout + estimate_tile_cost_bias_gelu_dropout
+# ---------------------------------------------------------------------------
+
+
+def test_bias_gelu_shape_cost_is_positive():
+    c = estimate_bias_gelu_dropout(M=2048, N=16384)
+    assert isinstance(c, CostEstimate)
+    assert c.fused_bytes > 0
+    assert c.bytes_saved > 0
+    assert 0.0 < c.score < 1.0
+
+
+def test_bias_gelu_shape_cost_savings_equal_two_round_trips():
+    """Two intermediates (post-bias, post-GELU) each round-trip = 4*M*N bytes total = 8*M*N."""
+    M, N = 2048, 16384
+    c = estimate_bias_gelu_dropout(M=M, N=N)
+    assert c.bytes_saved == 2 * (2 * M * N * 2)  # = 8 * M * N
+
+
+def test_bias_gelu_tile_cost_differs_across_plans():
+    M, N = 2048, 16384
+    plans = tile_plans_bias_gelu_dropout(N=N)
+    assert len(plans) >= 8
+    scores = {estimate_tile_cost_bias_gelu_dropout(M, N, p).score for p in plans}
+    assert len(scores) >= 2
+
+
+def test_bias_gelu_tile_cost_large_tile_worse_than_moderate():
+    """A 8x4096 fp32 register tile (128KB) is far over budget."""
+    M, N = 2048, 16384
+    big = estimate_tile_cost_bias_gelu_dropout(M, N, TilePlan(8, 4096, 4))
+    small = estimate_tile_cost_bias_gelu_dropout(M, N, TilePlan(1, 512, 4))
+    assert big.score > small.score

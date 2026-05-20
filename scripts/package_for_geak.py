@@ -22,15 +22,13 @@ _TASK_MD_TEMPLATE = """\
 ## What this kernel does
 
 This Triton kernel implements **{op}** on **{topology_name}** ({arch}).
-Shape: E={E}, T={T}, H={H}, group_size={group_size}. The kernel fuses SiLU,
-elementwise multiply, and per-group FP8 quantization so the bf16 silu*up
-intermediate never reaches HBM.
+
+- Shape: {shape_md}
+- Fusion plan: {fusion_md}
 
 ## Topo-Flow seed configuration
 
-- BLOCK_M = {BLOCK_M}
-- BLOCK_H = {BLOCK_H}
-- num_warps = {num_warps}
+{tile_plan_md}
 - Cost model score (fused/unfused, lower is better): {score:.4f}
 - Memory traffic saved vs. unfused: {bytes_saved:,} bytes
 
@@ -47,9 +45,8 @@ intent, risks, and Topo-Flow's suggested mutations.
 
 ## Constraints
 
-- Per-group amax/scale must use the same FP8_E4M3_MAX (448.0) as the seed.
-- Output dtype is fp8_e4m3; scale dtype is fp32.
-- `group_size` divides H. Do not change it without updating callers.
+- Tensor dtypes: {dtype_md}
+- Preserve the fusion semantics shown in `topoflow_metadata.json#fusion_plan`.
 - Keep TOPOFLOW_INTENT comments — downstream tooling reads them.
 """
 
@@ -69,18 +66,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _render_task_md(meta: dict) -> str:
+    shape_md = ", ".join(f"{k}={v}" for k, v in meta["shape"].items())
+    fusion_md = " -> ".join(meta.get("fusion_plan", [])) or "(unspecified)"
+    tile_plan_md = "\n".join(
+        f"- {k} = {v}" for k, v in meta["tile_plan"].items()
+    )
+    dtype_md = ", ".join(f"{k}={v}" for k, v in meta.get("dtype", {}).items())
     mutations_md = "\n".join(f"- {m}" for m in meta.get("suggested_mutations", []))
     return _TASK_MD_TEMPLATE.format(
         op=meta["op"],
         arch=meta["target_arch"],
         topology_name=meta["topology"]["name"],
-        E=meta["shape"]["E"],
-        T=meta["shape"]["T"],
-        H=meta["shape"]["H"],
-        group_size=meta["shape"]["group_size"],
-        BLOCK_M=meta["tile_plan"]["BLOCK_M"],
-        BLOCK_H=meta["tile_plan"]["BLOCK_H"],
-        num_warps=meta["tile_plan"]["num_warps"],
+        shape_md=shape_md,
+        fusion_md=fusion_md,
+        tile_plan_md=tile_plan_md,
+        dtype_md=dtype_md,
         score=meta["cost_model"]["score"],
         bytes_saved=meta["cost_model"]["bytes_saved"],
         mutations_md=mutations_md,

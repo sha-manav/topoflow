@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-DType = Literal["fp32", "fp16", "bf16", "fp8_e4m3", "fp8_e5m2", "int8"]
+DType = Literal["fp32", "fp16", "bf16", "fp8_e4m3", "fp8_e5m2", "int8", "bool"]
 
 
 @dataclass
