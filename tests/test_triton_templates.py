@@ -2,8 +2,12 @@ import ast
 
 import pytest
 
+from topoflow_prior.remap_planner import REMAP_KINDS
 from topoflow_prior.schemas import TilePlan
-from topoflow_prior.triton_templates import render_fused_silu_mul_fp8_quant
+from topoflow_prior.triton_templates import (
+    render_attention_remap,
+    render_fused_silu_mul_fp8_quant,
+)
 
 
 @pytest.fixture
@@ -70,3 +74,77 @@ def test_three_branches_cover_block_h_relative_to_group(shape):
             TilePlan(block_m=16, block_h=bh, num_warps=4), shape
         )
         ast.parse(code)
+
+
+# ---------------------------------------------------------------------------
+# render_attention_remap
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def attn_plan():
+    return TilePlan(block_m=64, block_h=64, num_warps=4)
+
+
+@pytest.fixture
+def attn_shape():
+    return {"head_dim": 128, "num_xcds": 8}
+
+
+def test_render_attention_remap_all_four_kinds_parse(attn_plan, attn_shape):
+    """Every REMAP_KIND must render as valid Python."""
+    rendered = {}
+    for kind in REMAP_KINDS:
+        code = render_attention_remap(attn_plan, kind, attn_shape)
+        ast.parse(code)
+        rendered[kind] = code
+    # Each variant must have a distinct decomposition body — no two should be byte-identical.
+    assert len(set(rendered.values())) == len(REMAP_KINDS)
+
+
+def test_render_attention_remap_unknown_kind_raises(attn_plan, attn_shape):
+    with pytest.raises(ValueError, match="remap_kind"):
+        render_attention_remap(attn_plan, "bogus_kind", attn_shape)
+
+
+def test_render_attention_remap_contains_topoflow_intent_and_kind(attn_plan, attn_shape):
+    code = render_attention_remap(attn_plan, "swizzled_head_first", attn_shape)
+    assert "# TOPOFLOW_INTENT" in code
+    assert code.count("# TOPOFLOW_INTENT") >= 3
+    assert "swizzled_head_first" in code
+    assert "@triton.jit" in code
+
+
+def test_render_attention_remap_embeds_tile_and_shape_constants():
+    plan = TilePlan(block_m=64, block_h=128, num_warps=8)
+    shape = {"head_dim": 64, "num_xcds": 8}
+    code = render_attention_remap(plan, "naive_block_first", shape)
+    assert "BLOCK_M = 64" in code
+    assert "BLOCK_N = 128" in code
+    assert "HEAD_DIM = 64" in code
+    assert "NUM_XCDS = 8" in code
+    assert "num_warps=8" in code
+
+
+def test_render_attention_remap_decompositions_use_different_arithmetic(attn_plan, attn_shape):
+    """Each variant's program-id decomposition body must reference different
+    intermediate variables, so GEAK/LLM can see which mapping is in effect."""
+    naive_bf = render_attention_remap(attn_plan, "naive_block_first", attn_shape)
+    naive_hf = render_attention_remap(attn_plan, "naive_head_first", attn_shape)
+    swiz_bf = render_attention_remap(attn_plan, "swizzled_block_first", attn_shape)
+    swiz_hf = render_attention_remap(attn_plan, "swizzled_head_first", attn_shape)
+
+    # Only naive_block_first should compute pid_h = rem // num_m
+    assert "pid_h = rem // num_m" in naive_bf
+    assert "pid_h = rem // num_m" not in naive_hf
+    # Only naive_head_first should compute pid_m = rem // num_heads
+    assert "pid_m = rem // num_heads" in naive_hf
+    assert "pid_m = rem // num_heads" not in naive_bf
+    # Only swizzled variants reference NUM_XCDS in the decomposition.
+    assert "xcd = rem % NUM_XCDS" in swiz_bf
+    assert "xcd = rem % NUM_XCDS" in swiz_hf
+    assert "xcd = rem % NUM_XCDS" not in naive_bf
+    assert "xcd = rem % NUM_XCDS" not in naive_hf
+    # swizzled_block_first references blocks_per_xcd; swizzled_head_first references head_in_xcd.
+    assert "blocks_per_xcd" in swiz_bf and "blocks_per_xcd" not in swiz_hf
+    assert "head_in_xcd" in swiz_hf and "head_in_xcd" not in swiz_bf
