@@ -1,0 +1,13 @@
+# Shape configurations for the fused SiLU + Mul + FP8 quantization target
+# (AITER issue #2420). Used by generate_seeds.py / future sweep scripts.
+#
+# Each entry maps to: x: [E, T, 2H] bf16 -> y_fp8: [E, T, H] fp8 + scale [E, T, H/group_size] fp32
+# where E is expert (or batch) count, T is tokens-per-expert, H is the hidden
+# per-half (output H; input has 2H), and group_size is the FP8 quant group.
+
+shapes:
+  - {E: 1,  T: 128,  H: 4096, group_size: 128}   # small batch
+  - {E: 8,  T: 1024, H: 4096, group_size: 128}   # medium, Llama-8B
+  - {E: 32, T: 1024, H: 4096, group_size: 128}   # large batch, Llama-8B
+  - {E: 8,  T: 1024, H: 8192, group_size: 128}   # Llama-7 hidden
+  - {E: 64, T: 256,  H: 4096, group_size: 128}   # many experts, short seq

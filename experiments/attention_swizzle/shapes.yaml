@@ -1,0 +1,12 @@
+# Shape configurations for the attention workgroup remapping target
+# (arXiv 2511.02132 — NUMA attention on MI300X).
+#
+# Each entry describes a Q / K / V tensor shape [batch, num_heads, seq_len, head_dim].
+# The remap planner emits four workgroup orderings per shape (naive_block_first,
+# naive_head_first, swizzled_block_first, swizzled_head_first); swizzled variants
+# require num_heads % num_xcds == 0 (8 XCDs on MI300X).
+
+shapes:
+  - {batch: 1, seq_len: 2048, num_heads: 32, head_dim: 128}   # Llama-8B
+  - {batch: 1, seq_len: 4096, num_heads: 32, head_dim: 128}   # longer seq
+  - {batch: 4, seq_len: 2048, num_heads: 64, head_dim: 128}   # Llama-70B
