@@ -41,9 +41,20 @@ def test_rendered_code_contains_triton_jit(plan, shape):
 def test_rendered_code_embeds_tile_constants(plan, shape):
     code = render_fused_silu_mul_fp8_quant(plan, shape)
     assert "BLOCK_M" in code
-    assert f"BLOCK_M: tl.constexpr = {plan.block_m}" in code
-    assert f"BLOCK_H: tl.constexpr = {plan.block_h}" in code
+    assert f"BLOCK_M = {plan.block_m}" in code
+    assert f"BLOCK_H = {plan.block_h}" in code
     assert f"num_warps={plan.num_warps}" in code
+
+
+def test_module_level_constants_are_not_constexpr_annotated(plan, shape):
+    """Module-level constants must be plain ints; tl.constexpr is only valid
+    on @triton.jit kernel parameters, not on module-level assignments."""
+    code = render_fused_silu_mul_fp8_quant(plan, shape)
+    # Bug guard: never reintroduce module-level `NAME: tl.constexpr = ...`.
+    for name in ("BLOCK_M", "BLOCK_H", "GROUP_SIZE", "FP8_E4M3_MAX"):
+        assert f"{name}: tl.constexpr = " not in code, (
+            f"{name} is annotated tl.constexpr at module level; should be plain int"
+        )
 
 
 def test_different_plans_produce_different_code(shape):

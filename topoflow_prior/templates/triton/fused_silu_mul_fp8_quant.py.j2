@@ -12,10 +12,10 @@ import torch
 import triton
 import triton.language as tl
 
-BLOCK_M: tl.constexpr = {{ BLOCK_M }}
-BLOCK_H: tl.constexpr = {{ BLOCK_H }}
-GROUP_SIZE: tl.constexpr = {{ GROUP_SIZE }}
-FP8_E4M3_MAX: tl.constexpr = 448.0
+BLOCK_M = {{ BLOCK_M }}
+BLOCK_H = {{ BLOCK_H }}
+GROUP_SIZE = {{ GROUP_SIZE }}
+FP8_E4M3_MAX = 448.0
 
 
 @triton.jit
