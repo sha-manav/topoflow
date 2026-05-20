@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .cost_model import estimate_fused_silu_mul_fp8_quant
+from .cost_model import estimate_fused_silu_mul_fp8_quant, estimate_tile_cost
 from .dataflow import fused_silu_mul_fp8_quant_dfg
 from .schemas import (
     CostEstimate,
@@ -32,11 +32,17 @@ local to the tile.
 - GROUP_SIZE = {group_size}
 - num_warps = {num_warps}
 
-## Cost model (memory traffic)
-- fused bytes:   {fused_bytes:,}
-- unfused bytes: {unfused_bytes:,}
-- bytes saved:   {bytes_saved:,}
-- score (fused/unfused, lower is better): {score:.4f}
+## Cost model — tile level (lower score = better)
+- fused bytes (tile-adjusted):   {fused_bytes:,}
+- unfused bytes:                 {unfused_bytes:,}
+- bytes saved (may be negative): {bytes_saved:,}
+- score:                         {score:.4f}
+
+## Cost model — shape level (op-level fused vs unfused)
+- shape fused bytes:   {shape_fused_bytes:,}
+- shape unfused bytes: {shape_unfused_bytes:,}
+- shape bytes saved:   {shape_bytes_saved:,}
+- shape score:         {shape_score:.4f}
 
 ## Risks
 - Register pressure: BLOCK_M * BLOCK_H fp32 in registers may reduce occupancy.
@@ -59,7 +65,8 @@ def _build_metadata(
     topology: TopologySpec,
     tile_plan: TilePlan,
     topology_plan: TopologyPlan,
-    cost: CostEstimate,
+    shape_cost: CostEstimate,
+    tile_cost: CostEstimate,
 ) -> dict[str, Any]:
     return {
         "candidate_id": candidate_id,
@@ -84,11 +91,21 @@ def _build_metadata(
             "keep_group_quant_local": True,
             "notes": topology_plan.notes,
         },
+        # Per-candidate score with tile-level penalties applied
+        # (register pressure, two-pass re-read, vectorization).
         "cost_model": {
-            "fused_bytes": cost.fused_bytes,
-            "unfused_bytes": cost.unfused_bytes,
-            "bytes_saved": cost.bytes_saved,
-            "score": cost.score,
+            "fused_bytes": tile_cost.fused_bytes,
+            "unfused_bytes": tile_cost.unfused_bytes,
+            "bytes_saved": tile_cost.bytes_saved,
+            "score": tile_cost.score,
+        },
+        # Shape-level estimate: how much HBM traffic fusion saves at this
+        # (E, T, H, group_size) regardless of tile choice. Always positive.
+        "shape_cost": {
+            "fused_bytes": shape_cost.fused_bytes,
+            "unfused_bytes": shape_cost.unfused_bytes,
+            "bytes_saved": shape_cost.bytes_saved,
+            "score": shape_cost.score,
         },
         "fusion_plan": [
             "silu",
@@ -141,7 +158,7 @@ def generate_seeds_for_fused_silu_mul_fp8_quant(
     # Validate dataflow loads (used downstream by GEAK introspection).
     _ = fused_silu_mul_fp8_quant_dfg()
 
-    cost = estimate_fused_silu_mul_fp8_quant(
+    shape_cost = estimate_fused_silu_mul_fp8_quant(
         E=shape["E"], T=shape["T"], H=shape["H"], group_size=shape["group_size"]
     )
 
@@ -156,13 +173,21 @@ def generate_seeds_for_fused_silu_mul_fp8_quant(
     for i, plan in enumerate(plans):
         cid = f"fused_silu_mul_fp8_quant_v{i:03d}"
         kernel_code = render_fused_silu_mul_fp8_quant(plan, shape)
+        tile_cost = estimate_tile_cost(
+            E=shape["E"],
+            T=shape["T"],
+            H=shape["H"],
+            group_size=shape["group_size"],
+            tile_plan=plan,
+        )
         metadata = _build_metadata(
             candidate_id=cid,
             shape=shape,
             topology=topology,
             tile_plan=plan,
             topology_plan=topology_plan,
-            cost=cost,
+            shape_cost=shape_cost,
+            tile_cost=tile_cost,
         )
         notes = _NOTES_TEMPLATE.format(
             candidate_id=cid,
@@ -172,10 +197,14 @@ def generate_seeds_for_fused_silu_mul_fp8_quant(
             block_h=plan.block_h,
             group_size=shape["group_size"],
             num_warps=plan.num_warps,
-            fused_bytes=cost.fused_bytes,
-            unfused_bytes=cost.unfused_bytes,
-            bytes_saved=cost.bytes_saved,
-            score=cost.score,
+            fused_bytes=tile_cost.fused_bytes,
+            unfused_bytes=tile_cost.unfused_bytes,
+            bytes_saved=tile_cost.bytes_saved,
+            score=tile_cost.score,
+            shape_fused_bytes=shape_cost.fused_bytes,
+            shape_unfused_bytes=shape_cost.unfused_bytes,
+            shape_bytes_saved=shape_cost.bytes_saved,
+            shape_score=shape_cost.score,
         )
         _write_candidate(out_dir, cid, kernel_code, metadata, notes)
         candidates.append(
@@ -185,7 +214,7 @@ def generate_seeds_for_fused_silu_mul_fp8_quant(
                 kernel_code=kernel_code,
                 tile_plan=plan,
                 topology_plan=topology_plan,
-                cost=cost,
+                cost=tile_cost,
                 metadata=metadata,
                 notes=notes,
             )

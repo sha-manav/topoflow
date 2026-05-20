@@ -40,7 +40,10 @@ def test_full_pipeline_produces_12_plus_valid_candidates_and_tasks(tmp_path):
         assert meta["op"] == "fused_silu_mul_fp8_quant"
         assert meta["target_arch"] == "gfx942"
         assert set(meta["tile_plan"]) == {"BLOCK_M", "BLOCK_H", "num_warps"}
-        assert meta["cost_model"]["bytes_saved"] > 0
+        # shape_cost is the op-level fused-vs-unfused traffic — always positive.
+        # cost_model.bytes_saved may be negative for tiles whose register-spill
+        # penalty pushes the tile-adjusted fused traffic above unfused.
+        assert meta["shape_cost"]["bytes_saved"] > 0
 
         # 3) notes are present.
         notes = (c / "topoflow_notes.md").read_text()
